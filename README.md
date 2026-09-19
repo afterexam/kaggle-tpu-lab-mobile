@@ -28,6 +28,10 @@ An Android companion application integrating model scheduling, multi-account pre
 
 ```
 ├── android/               # Capacitor native Android project & Gradle build files
+├── kernels/               # Bundled TPU kernel launch scripts & GLM engine sources
+│   ├── serve_qwen38.py    # Qwen3.8-27B TPU bootstrapper
+│   ├── serve_glm53.py     # GLM-5.3-Flash TPU bootstrapper
+│   └── glm53/             # GLM engine Python package for JAX/Pallas inference
 ├── src/
 │   ├── components/        # UI components (Dashboard, Chat, Settings, Export)
 │   ├── services/          # Core services (Kaggle API, Race state machine, ntfy listener, Chat)
@@ -35,6 +39,7 @@ An Android companion application integrating model scheduling, multi-account pre
 │   └── index.css          # Dark neon design system
 ├── build_apk.sh           # Automated APK compilation script (Debian WSL / Linux)
 ├── capacitor.config.ts    # Capacitor cross-platform configuration
+├── generate_templates.py  # Self-contained template bundler (packages kernels into TypeScript)
 └── package.json           # Frontend dependency manifest
 ```
 
@@ -63,8 +68,10 @@ Upon successful compilation, the APK is generated at `kaggle-tpu-lab.apk`.
 
 ```bash
 npm install
+npm run generate  # Re-embeds kernels/ into templates_data.ts
 npm run dev
 ```
 
 Open `http://localhost:5173` in your browser for full interactive testing.
+
 

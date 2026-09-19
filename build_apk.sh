@@ -20,19 +20,22 @@ echo "JAVA_HOME: $JAVA_HOME"
 echo "ANDROID_HOME: $ANDROID_HOME"
 java -version
 
-echo -e "${BLUE}=== 2. Build frontend Web application (Vite + React) ===${NC}"
+echo -e "${BLUE}=== 2. Generate kernel templates from source ===${NC}"
+python3 generate_templates.py
+
+echo -e "${BLUE}=== 3. Build frontend Web application (Vite + React) ===${NC}"
 npm run build
 
-echo -e "${BLUE}=== 3. Sync Capacitor Android native project ===${NC}"
+echo -e "${BLUE}=== 4. Sync Capacitor Android native project ===${NC}"
 npx cap sync android
 
-echo -e "${BLUE}=== 4. Sync to Linux ext4 virtual disk (avoiding WSL 9p file lock & I/O errors) ===${NC}"
+echo -e "${BLUE}=== 5. Sync to Linux ext4 virtual disk (avoiding WSL 9p file lock & I/O errors) ===${NC}"
 BUILD_WORK_DIR="/root/apk_build"
 mkdir -p "$BUILD_WORK_DIR"
 echo "Syncing project to $BUILD_WORK_DIR ..."
 rsync -a --delete --exclude=".gradle" "$SCRIPT_DIR/" "$BUILD_WORK_DIR/"
 
-echo -e "${BLUE}=== 5. Compile Debug APK with Gradle (running on ext4 high-speed disk) ===${NC}"
+echo -e "${BLUE}=== 6. Compile Debug APK with Gradle (running on ext4 high-speed disk) ===${NC}"
 cd "$BUILD_WORK_DIR/android"
 chmod +x gradlew
 ./gradlew assembleDebug --no-daemon
