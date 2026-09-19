@@ -15,6 +15,7 @@ import {
   EyeOff,
 } from 'lucide-react';
 import { Preferences } from '@capacitor/preferences';
+import { secretStore } from '../services/secureStore';
 
 interface SettingsViewProps {
   accounts: KaggleAccount[];
@@ -117,11 +118,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const handleSaveAll = async () => {
     onUpdateAccounts(localAccounts);
     onUpdateConfig(localConfig);
+    // Accounts hold Kaggle API tokens → encrypted store. Config has no
+    // secrets → stays in Preferences.
+    await secretStore.set('ktl_accounts', JSON.stringify(localAccounts));
     try {
-      await Preferences.set({ key: 'ktl_accounts', value: JSON.stringify(localAccounts) });
       await Preferences.set({ key: 'ktl_config', value: JSON.stringify(localConfig) });
     } catch {
-      localStorage.setItem('ktl_accounts', JSON.stringify(localAccounts));
       localStorage.setItem('ktl_config', JSON.stringify(localConfig));
     }
     setSaveSuccess(true);

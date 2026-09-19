@@ -46,6 +46,9 @@ jobs:
       - name: Generate kernel templates
         run: python3 generate_templates.py
 
+      - name: Run unit tests
+        run: npm test
+
       - name: Build web application
         run: npm run build
 

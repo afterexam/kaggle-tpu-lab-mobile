@@ -21,7 +21,8 @@ export const GLM_DATASETS = [
 /**
  * Format a JS object as a Python dict literal
  */
-function formatPythonValue(val: unknown): string {
+/** Render a JS value as a Python literal (exported for unit tests). */
+export function formatPythonValue(val: unknown): string {
   if (val === null || val === undefined) return 'None';
   if (typeof val === 'boolean') return val ? 'True' : 'False';
   if (typeof val === 'number') return String(val);

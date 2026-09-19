@@ -2,12 +2,43 @@ import { KaggleAccount, LaunchConfig, RaceSession, LiveEndpoint, NtfyEvent, getS
 import { KaggleApi } from './kaggle';
 import { prepareKernel } from './templates';
 import { NtfyListener } from './ntfy';
+import { randomApiKey, randomTopicId } from './random';
 
 export type InstanceUpdateCallback = (
   sessions: RaceSession[],
   activeEndpoint?: LiveEndpoint,
   allEndpoints?: LiveEndpoint[]
 ) => void;
+
+/**
+ * Pure mount decision, extracted from `InstanceManager.handleNtfyEvent` so the
+ * race veto logic is unit-testable.
+ *
+ * - `mount`: a genuine serving signal (ready/serving/heartbeat) with a valid
+ *   http(s) URL arrived and Kaggle does not report QUEUED → mount it.
+ * - `veto-queued`: valid signal + URL, but Kaggle explicitly reports QUEUED →
+ *   do NOT mount prematurely (and do not run the heartbeat-uptime branch).
+ * - `skip`: no valid URL or not a serving phase → fall through to the
+ *   heartbeat-uptime branch / no-op.
+ */
+export function decideEndpointMount(opts: {
+  status: RaceSession['status'];
+  phase: NtfyEvent['phase'];
+  sessionEndpointUrl?: string;
+  eventEndpoint?: string;
+  existingBaseUrl?: string;
+}): { kind: 'mount'; url: string } | { kind: 'veto-queued' } | { kind: 'skip' } {
+  const rawUrl = (opts.sessionEndpointUrl || opts.eventEndpoint || opts.existingBaseUrl || '').trim();
+  const hasValidHttp = rawUrl.startsWith('http://') || rawUrl.startsWith('https://');
+  const isServingPhase = opts.phase === 'ready' || opts.phase === 'serving' || opts.phase === 'heartbeat';
+  if (!hasValidHttp || !isServingPhase) return { kind: 'skip' };
+  // Kaggle status veto: if Kaggle explicitly remains QUEUED, do not mount the READY endpoint prematurely.
+  if (opts.status === 'QUEUED') return { kind: 'veto-queued' };
+  // Strip trailing slashes so `https://host/` does not become `https://host//v1`.
+  const trimmed = rawUrl.replace(/\/+$/, '');
+  const url = trimmed.endsWith('/v1') ? trimmed : `${trimmed}/v1`;
+  return { kind: 'mount', url };
+}
 
 export class InstanceManager {
   private sessions: Map<string, RaceSession> = new Map();
@@ -60,8 +91,9 @@ export class InstanceManager {
     if (!account.token) throw new Error(`Missing API token for account [${account.name || account.username}]`);
     await this.stopAccount(account.id);
 
-    const topic = 'ktl-' + Math.random().toString(16).substring(2, 10) + Math.random().toString(16).substring(2, 10);
-    const apiKey = (config.model === 'glm53-flash' ? 'glm-' : 'sk-') + Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
+    // Per-account random topic + API key (crypto-secure, see services/random.ts)
+    const topic = randomTopicId();
+    const apiKey = randomApiKey(config.model === 'glm53-flash' ? 'glm-' : 'sk-');
     const prep = prepareKernel(config.model, config, topic, apiKey);
     const api = new KaggleApi(account.token, account.username);
 
@@ -165,37 +197,39 @@ export class InstanceManager {
 
     // Mount ready endpoint only when receiving authentic serving / ready / heartbeat while not queued
     // Note: tunnel-url phase only records URL; never mark READY prematurely (aligning with launch.py)
-    const rawUrl = (session.endpointUrl || ev.endpoint || session.endpoint?.baseUrl || '').trim();
-    const hasValidHttp = rawUrl.startsWith('http://') || rawUrl.startsWith('https://');
+    const verdict = decideEndpointMount({
+      status: session.status,
+      phase: ev.phase,
+      sessionEndpointUrl: session.endpointUrl,
+      eventEndpoint: ev.endpoint,
+      existingBaseUrl: session.endpoint?.baseUrl,
+    });
 
-    if (hasValidHttp && (ev.phase === 'ready' || ev.phase === 'serving' || ev.phase === 'heartbeat')) {
-      // Kaggle status veto: if Kaggle explicitly remains QUEUED, do not mount READY endpoint prematurely
-      if (session.status !== 'QUEUED') {
-        const cleanBaseUrl = rawUrl.endsWith('/v1') ? rawUrl : `${rawUrl}/v1`;
-        session.endpointUrl = cleanBaseUrl;
-        const uptime = typeof ev.up_min === 'number' ? ev.up_min : (ev.up_min ? parseInt(String(ev.up_min), 10) : session.endpoint?.uptimeMinutes);
-        const ep: LiveEndpoint = {
-          accountId: session.account,
-          accountName: session.accountName,
-          baseUrl: cleanBaseUrl,
-          apiKey: ev.api_key || session.apiKey,
-          model: getServedModelName(ev.model || session.model || modelName),
-          status: 'READY',
-          tokensPerSec: ev.decode_tok_s ? String(ev.decode_tok_s) : session.endpoint?.tokensPerSec,
-          uptimeMinutes: uptime,
-        };
-        if (ev.api_key) session.apiKey = ev.api_key;
-        session.endpoint = ep;
-        this.endpoints.set(session.account, ep);
-        if (session.status !== 'RUNNING' && session.status !== 'WINNER') {
-          session.status = 'RUNNING';
-          session.done = false;
-        }
-        if (session.raceGroupId && (ev.phase === 'ready' || ev.phase === 'serving')) {
-          this.checkRaceWinner(session);
-        }
+    if (verdict.kind === 'mount') {
+      const cleanBaseUrl = verdict.url;
+      session.endpointUrl = cleanBaseUrl;
+      const uptime = typeof ev.up_min === 'number' ? ev.up_min : (ev.up_min ? parseInt(String(ev.up_min), 10) : session.endpoint?.uptimeMinutes);
+      const ep: LiveEndpoint = {
+        accountId: session.account,
+        accountName: session.accountName,
+        baseUrl: cleanBaseUrl,
+        apiKey: ev.api_key || session.apiKey,
+        model: getServedModelName(ev.model || session.model || modelName),
+        status: 'READY',
+        tokensPerSec: ev.decode_tok_s ? String(ev.decode_tok_s) : session.endpoint?.tokensPerSec,
+        uptimeMinutes: uptime,
+      };
+      if (ev.api_key) session.apiKey = ev.api_key;
+      session.endpoint = ep;
+      this.endpoints.set(session.account, ep);
+      if (session.status !== 'RUNNING' && session.status !== 'WINNER') {
+        session.status = 'RUNNING';
+        session.done = false;
       }
-    } else if (ev.phase === 'heartbeat') {
+      if (session.raceGroupId && (ev.phase === 'ready' || ev.phase === 'serving')) {
+        this.checkRaceWinner(session);
+      }
+    } else if (ev.phase === 'heartbeat' && verdict.kind === 'skip') {
       const ep = this.endpoints.get(session.account);
       if (ep) {
         ep.uptimeMinutes = typeof ev.up_min === 'number' ? ev.up_min : parseInt(String(ev.up_min || 0), 10);
