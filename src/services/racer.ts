@@ -3,6 +3,7 @@ import { KaggleApi } from './kaggle';
 import { prepareKernel } from './templates';
 import { NtfyListener } from './ntfy';
 import { randomApiKey, randomTopicId } from './random';
+import { startQueueMonitoring, stopQueueMonitoring } from './queueMonitor';
 
 export type InstanceUpdateCallback = (
   sessions: RaceSession[],
@@ -43,6 +44,9 @@ export function decideEndpointMount(opts: {
 export class InstanceManager {
   private sessions: Map<string, RaceSession> = new Map();
   private listeners: Map<string, NtfyListener> = new Map();
+  // accountId -> ntfy topic currently watched by the native foreground-service
+  // monitor (survives the app going to background; the WebView JS loop does not)
+  private nativeTopics: Map<string, string> = new Map();
   private endpoints: Map<string, LiveEndpoint> = new Map();
   private pollInterval: any = null;
   private onUpdateCb: InstanceUpdateCallback;
@@ -167,8 +171,31 @@ export class InstanceManager {
       });
     }
 
+    // Hand the final topic (adopted kernels use the remote topic) to the
+    // native foreground-service monitor so the user is notified on
+    // ready/serving even with the app backgrounded.
+    if (!session.done && session.topic) {
+      this.startNativeMonitor(account.id, session.topic);
+    }
+
     this.notify();
     this.ensurePolling();
+  }
+
+  /** Hand a topic to the native background monitor (fire-and-forget). */
+  private startNativeMonitor(accountId: string, topic: string): void {
+    this.stopNativeMonitor(accountId);
+    this.nativeTopics.set(accountId, topic);
+    startQueueMonitoring(topic).catch(() => {});
+  }
+
+  /** Withdraw a topic from the native background monitor. */
+  private stopNativeMonitor(accountId: string): void {
+    const topic = this.nativeTopics.get(accountId);
+    if (topic !== undefined) {
+      this.nativeTopics.delete(accountId);
+      stopQueueMonitoring(topic).catch(() => {});
+    }
   }
 
   public async startSingle(account: KaggleAccount, config: LaunchConfig): Promise<void> {
@@ -229,6 +256,10 @@ export class InstanceManager {
       if (session.raceGroupId && (ev.phase === 'ready' || ev.phase === 'serving')) {
         this.checkRaceWinner(session);
       }
+      // Endpoint is live — the native background monitor has done its job.
+      if (ev.phase === 'ready' || ev.phase === 'serving') {
+        this.stopNativeMonitor(session.account);
+      }
     } else if (ev.phase === 'heartbeat' && verdict.kind === 'skip') {
       const ep = this.endpoints.get(session.account);
       if (ep) {
@@ -242,6 +273,7 @@ export class InstanceManager {
       const ep = this.endpoints.get(session.account);
       if (ep) ep.status = 'OFFLINE';
       this.endpoints.delete(session.account);
+      this.stopNativeMonitor(session.account);
     }
     this.notify();
   }
@@ -264,6 +296,7 @@ export class InstanceManager {
         });
         const l = this.listeners.get(accId);
         if (l) { l.stop(); this.listeners.delete(accId); }
+        this.stopNativeMonitor(accId);
         new KaggleApi(rival.token, rival.username).cancelKernel(rival.slug).catch(() => {});
       }
     }
@@ -523,6 +556,7 @@ export class InstanceManager {
   public async stopAccount(accountId: string): Promise<void> {
     const listener = this.listeners.get(accountId);
     if (listener) { listener.stop(); this.listeners.delete(accountId); }
+    this.stopNativeMonitor(accountId);
 
     const session = this.sessions.get(accountId);
     if (session && !session.done) {
