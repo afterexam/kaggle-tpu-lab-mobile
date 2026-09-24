@@ -13,7 +13,9 @@
  *   Documented limitation — the shipped app is native-only.
  *
  * Previously stored plaintext values are lazily migrated into the secure
- * backend on first read and wiped from the legacy store.
+ * backend on first read and wiped from the legacy store — but only after a
+ * read-back verifies the secure write, so a broken Keystore can never
+ * destroy the only copy of a secret.
  */
 import { Preferences } from '@capacitor/preferences';
 import { Capacitor } from '@capacitor/core';
@@ -108,6 +110,17 @@ export class FallbackBackend implements KeyValueBackend {
     private fallback: KeyValueBackend,
   ) {}
 
+  /**
+   * The secure backend underneath the fallback wrapper. Migration code uses
+   * this (not `set()`) so it can verify a write really landed in secure
+   * storage before wiping the plaintext copy — `set()` silently degrades to
+   * the legacy backend when the Keystore is unavailable, and wiping after
+   * such a degraded write would destroy the only copy of the secret.
+   */
+  get primaryBackend(): KeyValueBackend {
+    return this.primary;
+  }
+
   private warnOnce() {
     if (!warnedInsecure) {
       warnedInsecure = true;
@@ -160,20 +173,47 @@ export interface SecretStore {
  */
 export function createSecretStore(secure: KeyValueBackend, legacy: KeyValueBackend): SecretStore {
   const sameStore = secure === legacy;
+  // The backend a plaintext copy may be wiped after: the real secure store,
+  // never the silent-fallback wrapper (whose set() can degrade to legacy).
+  const verifyBackend = secure instanceof FallbackBackend ? secure.primaryBackend : secure;
+
+  /**
+   * Move one legacy plaintext value into the secure backend.
+   *
+   * The legacy copy is wiped ONLY after a read-back proves the value landed
+   * in secure storage. If the secure backend is unavailable (or the write
+   * doesn't stick), the legacy copy is left alone and returned — availability
+   * beats secrecy, and we must never destroy the only copy of a secret.
+   */
+  async function migrateOne(key: string): Promise<string | null> {
+    let lv: string | null;
+    try {
+      lv = await legacy.get(key);
+    } catch {
+      return null;
+    }
+    if (lv === null || lv === undefined) return null;
+    try {
+      await verifyBackend.set(key, lv);
+      const check = await verifyBackend.get(key);
+      if (check === lv) {
+        await legacy.remove(key);
+      }
+      // else: write didn't stick — keep the legacy copy.
+    } catch {
+      // Secure backend unavailable — leave the legacy copy alone.
+    }
+    return lv;
+  }
+
   return {
     async get(key: string): Promise<string | null> {
       const v = await secure.get(key);
       if (v !== null && v !== undefined) return v;
       if (sameStore) return null;
       // Lazy migration: move the legacy plaintext value into the secure
-      // backend on first read, then wipe the plaintext copy.
-      const lv = await legacy.get(key);
-      if (lv !== null && lv !== undefined) {
-        await secure.set(key, lv);
-        await legacy.remove(key);
-        return lv;
-      }
-      return null;
+      // backend on first read (wiped only after verified write).
+      return migrateOne(key);
     },
     async set(key: string, value: string): Promise<void> {
       await secure.set(key, value);
@@ -185,11 +225,7 @@ export function createSecretStore(secure: KeyValueBackend, legacy: KeyValueBacke
     async migrateLegacy(): Promise<void> {
       if (sameStore) return;
       for (const key of SECRET_KEYS) {
-        const lv = await legacy.get(key);
-        if (lv !== null && lv !== undefined) {
-          await secure.set(key, lv);
-          await legacy.remove(key);
-        }
+        await migrateOne(key);
       }
     },
   };

@@ -97,10 +97,63 @@ describe('createSecretStore', () => {
 
     expect(backend.store.get('ktl_accounts')).toBe('v');
   });
+
+  describe('broken secure backend (regression: must never destroy the only copy)', () => {
+    const brokenPrimary = (): KeyValueBackend => ({
+      get: async () => { throw new Error('no keystore'); },
+      set: async () => { throw new Error('no keystore'); },
+      remove: async () => { throw new Error('no keystore'); },
+    });
+
+    it('migrateLegacy() keeps the legacy copy when the Keystore is unavailable', async () => {
+      const legacy = new MemoryBackend();
+      await legacy.set('ktl_accounts', '[{"token":"KGAT_secret"}]');
+      const store = createSecretStore(new FallbackBackend(brokenPrimary(), legacy), legacy);
+
+      await store.migrateLegacy();
+
+      // The only copy must survive; the app keeps working on plaintext.
+      expect(legacy.store.get('ktl_accounts')).toBe('[{"token":"KGAT_secret"}]');
+      expect(await store.get('ktl_accounts')).toBe('[{"token":"KGAT_secret"}]');
+    });
+
+    it('lazy get() migration keeps the legacy copy when the Keystore is unavailable', async () => {
+      const legacy = new MemoryBackend();
+      await legacy.set('ktl_sessions', '[{"apiKey":"sk-secret"}]');
+      const store = createSecretStore(new FallbackBackend(brokenPrimary(), legacy), legacy);
+
+      const value = await store.get('ktl_sessions');
+
+      expect(value).toBe('[{"apiKey":"sk-secret"}]');
+      expect(legacy.store.has('ktl_sessions')).toBe(true);
+      // Still there on the next read (restart).
+      expect(await store.get('ktl_sessions')).toBe('[{"apiKey":"sk-secret"}]');
+    });
+
+    it('does not wipe legacy when the secure write does not stick (read-back mismatch)', async () => {
+      // Simulate a backend that accepts writes but loses them.
+      const lossy: KeyValueBackend = {
+        get: async () => null,
+        set: async () => {},
+        remove: async () => {},
+      };
+      const legacy = new MemoryBackend();
+      await legacy.set('ktl_accounts', 'v');
+      const store = createSecretStore(new FallbackBackend(lossy, legacy), legacy);
+
+      await store.migrateLegacy();
+
+      expect(legacy.store.get('ktl_accounts')).toBe('v');
+    });
+  });
 });
 
 describe('FallbackBackend', () => {
   it('falls back to plaintext when the secure backend throws, and warns once', async () => {
+    // Fresh module instance: warnedInsecure is module-level, other tests may
+    // have already triggered the one-time warning.
+    vi.resetModules();
+    const { FallbackBackend: FreshFallback } = await import('./secureStore');
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const broken: KeyValueBackend = {
       get: async () => { throw new Error('no keystore'); },
@@ -109,7 +162,7 @@ describe('FallbackBackend', () => {
     };
     const legacy = new MemoryBackend();
     await legacy.set('ktl_accounts', 'fallback-value');
-    const backend = new FallbackBackend(broken, legacy);
+    const backend = new FreshFallback(broken, legacy);
 
     expect(await backend.get('ktl_accounts')).toBe('fallback-value');
     await backend.set('ktl_accounts', 'new-value');
