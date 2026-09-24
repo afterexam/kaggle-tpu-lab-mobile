@@ -16,6 +16,7 @@ kaggle-tpu-lab.apk
 .env.*.local
 *.key
 *.keystore
+!android/app/debug.keystore
 *.jks
 
 # Logs
