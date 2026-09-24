@@ -21,28 +21,50 @@ class MemoryBackend implements KeyValueBackend {
 }
 
 describe('createSecretStore', () => {
-  it('writes secrets to the secure backend only', async () => {
+  it('set() writes the durability anchor first, then mirrors into secure', async () => {
     const secure = new MemoryBackend();
     const legacy = new MemoryBackend();
     const store = createSecretStore(secure, legacy);
 
     await store.set('ktl_accounts', '[{"token":"KGAT_secret"}]');
 
+    // Legacy is the durability anchor: always written. Secure is a mirror.
+    expect(legacy.store.get('ktl_accounts')).toBe('[{"token":"KGAT_secret"}]');
     expect(secure.store.get('ktl_accounts')).toBe('[{"token":"KGAT_secret"}]');
-    expect(legacy.store.has('ktl_accounts')).toBe(false);
   });
 
-  it('reads from the secure backend when present', async () => {
-    const secure = new MemoryBackend();
+  it('set() never rejects when the secure backend throws (save must succeed)', async () => {
+    const broken: KeyValueBackend = {
+      get: async () => { throw new Error('no keystore'); },
+      set: async () => { throw new Error('no keystore'); },
+      remove: async () => { throw new Error('no keystore'); },
+    };
     const legacy = new MemoryBackend();
-    await secure.set('ktl_accounts', 'secure-value');
-    await legacy.set('ktl_accounts', 'stale-plaintext');
-    const store = createSecretStore(secure, legacy);
+    const store = createSecretStore(broken, legacy);
 
-    expect(await store.get('ktl_accounts')).toBe('secure-value');
+    await expect(store.set('ktl_accounts', 'v')).resolves.toBeUndefined();
+    expect(legacy.store.get('ktl_accounts')).toBe('v');
   });
 
-  it('lazily migrates legacy plaintext into the secure backend on first read', async () => {
+  it('get() serves the legacy anchor when the secure copy disagrees', async () => {
+    // A secure backend stuck on a stale value (e.g. writes stopped sticking
+    // after an earlier success): the anchor holds the fresher value and the
+    // reconcile must not wipe it.
+    const staleSecure: KeyValueBackend = {
+      get: async () => 'stale-secure',
+      set: async () => {},
+      remove: async () => {},
+    };
+    const legacy = new MemoryBackend();
+    await legacy.set('ktl_accounts', 'fresh-anchor');
+    const store = createSecretStore(staleSecure, legacy);
+
+    expect(await store.get('ktl_accounts')).toBe('fresh-anchor');
+    // Disagreement means secure is unreliable: the anchor must be kept.
+    expect(legacy.store.get('ktl_accounts')).toBe('fresh-anchor');
+  });
+
+  it('migrates legacy plaintext into the secure backend at boot and wipes it once proven', async () => {
     const secure = new MemoryBackend();
     const legacy = new MemoryBackend();
     await legacy.set('ktl_sessions', '[{"apiKey":"sk-secret"}]');
@@ -52,7 +74,7 @@ describe('createSecretStore', () => {
 
     expect(value).toBe('[{"apiKey":"sk-secret"}]');
     expect(secure.store.get('ktl_sessions')).toBe('[{"apiKey":"sk-secret"}]');
-    // Plaintext copy must be wiped after migration.
+    // Plaintext copy wiped only after the secure copy proved itself.
     expect(legacy.store.has('ktl_sessions')).toBe(false);
   });
 
@@ -104,11 +126,22 @@ describe('createSecretStore', () => {
       set: async () => { throw new Error('no keystore'); },
       remove: async () => { throw new Error('no keystore'); },
     });
+    // Simulates the real-world failure: writes resolve but nothing survives
+    // (silent loss, no throw) — the exact v1.1.2 data-loss report.
+    const lossyPrimary = (): KeyValueBackend => ({
+      get: async () => null,
+      set: async () => {},
+      remove: async () => {},
+    });
+    // A "restart" is a new store over the same backend instances: the lossy
+    // secure backend drops everything, the legacy anchor persists.
+    const restart = (secure: KeyValueBackend, legacy: KeyValueBackend) =>
+      createSecretStore(secure, legacy);
 
-    it('migrateLegacy() keeps the legacy copy when the Keystore is unavailable', async () => {
+    it('migrateLegacy() keeps the legacy copy when the Keystore throws', async () => {
       const legacy = new MemoryBackend();
       await legacy.set('ktl_accounts', '[{"token":"KGAT_secret"}]');
-      const store = createSecretStore(new FallbackBackend(brokenPrimary(), legacy), legacy);
+      const store = createSecretStore(brokenPrimary(), legacy);
 
       await store.migrateLegacy();
 
@@ -117,33 +150,69 @@ describe('createSecretStore', () => {
       expect(await store.get('ktl_accounts')).toBe('[{"token":"KGAT_secret"}]');
     });
 
-    it('lazy get() migration keeps the legacy copy when the Keystore is unavailable', async () => {
+    it('get() keeps serving the legacy copy when the Keystore throws', async () => {
       const legacy = new MemoryBackend();
       await legacy.set('ktl_sessions', '[{"apiKey":"sk-secret"}]');
-      const store = createSecretStore(new FallbackBackend(brokenPrimary(), legacy), legacy);
+      const store = createSecretStore(brokenPrimary(), legacy);
 
       const value = await store.get('ktl_sessions');
 
       expect(value).toBe('[{"apiKey":"sk-secret"}]');
       expect(legacy.store.has('ktl_sessions')).toBe(true);
       // Still there on the next read (restart).
-      expect(await store.get('ktl_sessions')).toBe('[{"apiKey":"sk-secret"}]');
+      expect(await restart(brokenPrimary(), legacy).get('ktl_sessions')).toBe(
+        '[{"apiKey":"sk-secret"}]',
+      );
     });
 
-    it('does not wipe legacy when the secure write does not stick (read-back mismatch)', async () => {
-      // Simulate a backend that accepts writes but loses them.
-      const lossy: KeyValueBackend = {
-        get: async () => null,
-        set: async () => {},
-        remove: async () => {},
-      };
+    it('does not wipe legacy when the secure write does not stick (silent loss)', async () => {
       const legacy = new MemoryBackend();
       await legacy.set('ktl_accounts', 'v');
-      const store = createSecretStore(new FallbackBackend(lossy, legacy), legacy);
+      const store = createSecretStore(lossyPrimary(), legacy);
 
       await store.migrateLegacy();
 
       expect(legacy.store.get('ktl_accounts')).toBe('v');
+    });
+
+    it('set() then restart: data survives a secure backend that silently loses writes', async () => {
+      // This is the reported v1.1.2 bug: save resolved, reopen showed empty.
+      const lossy = lossyPrimary();
+      const legacy = new MemoryBackend();
+      const store = createSecretStore(lossy, legacy);
+
+      await store.set('ktl_accounts', '[{"user":"retgry"}]');
+
+      const afterRestart = restart(lossy, legacy);
+      expect(await afterRestart.get('ktl_accounts')).toBe('[{"user":"retgry"}]');
+      expect(legacy.store.get('ktl_accounts')).toBe('[{"user":"retgry"}]');
+    });
+
+    it('set() then restart: data survives a secure backend that throws', async () => {
+      const broken = brokenPrimary();
+      const legacy = new MemoryBackend();
+      const store = createSecretStore(broken, legacy);
+
+      await store.set('ktl_accounts', '[{"user":"retgry"}]');
+
+      const afterRestart = restart(broken, legacy);
+      expect(await afterRestart.get('ktl_accounts')).toBe('[{"user":"retgry"}]');
+    });
+
+    it('converges to secure-only on a healthy device across restarts', async () => {
+      const secure = new MemoryBackend();
+      const legacy = new MemoryBackend();
+      const store = createSecretStore(secure, legacy);
+
+      await store.set('ktl_accounts', 'v');
+      // Plaintext anchor present until the secure copy proves itself.
+      expect(legacy.store.has('ktl_accounts')).toBe(true);
+
+      const afterRestart = restart(secure, legacy);
+      expect(await afterRestart.get('ktl_accounts')).toBe('v');
+      // Secure copy matched the anchor across the restart: wiped.
+      expect(legacy.store.has('ktl_accounts')).toBe(false);
+      expect(secure.store.get('ktl_accounts')).toBe('v');
     });
   });
 });

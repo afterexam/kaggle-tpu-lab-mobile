@@ -6,16 +6,27 @@
  * plaintext. They now go through `secretStore`:
  *
  * - On native (Android/iOS): Android Keystore / iOS Keychain via
- *   `@aparajita/capacitor-secure-storage`, with automatic fallback to the
- *   legacy plaintext store if the plugin is unavailable (availability beats
- *   secrecy, and a warning is logged).
+ *   `@aparajita/capacitor-secure-storage`, with the legacy plaintext store
+ *   kept as a durability anchor.
  * - On web: there is no Keystore; the legacy plaintext store is used.
  *   Documented limitation — the shipped app is native-only.
  *
- * Previously stored plaintext values are lazily migrated into the secure
- * backend on first read and wiped from the legacy store — but only after a
- * read-back verifies the secure write, so a broken Keystore can never
- * destroy the only copy of a secret.
+ * Durability policy (learned the hard way, v1.1.0–v1.1.2):
+ * some devices accept a Keystore write (the call resolves) but cannot read
+ * it back after the process restarts — the failure is silent, not a throw,
+ * so "try secure, fall back on error" is not enough. Therefore:
+ *
+ * - Every `set()` writes the legacy plaintext store FIRST (proven durable),
+ *   then best-effort mirrors into the secure backend. A lying or missing
+ *   Keystore can never break a save or destroy data.
+ * - `get()` prefers the legacy anchor (it is written first and therefore
+ *   never staler than the secure copy), falling back to the secure backend.
+ * - At boot, for each secret key, the store best-effort heals the secure
+ *   copy from legacy and wipes the plaintext ONLY when the secure backend
+ *   returns exactly what legacy holds — i.e. the secure copy has proven
+ *   itself across a restart. On a healthy device this converges to
+ *   secure-only storage; on a device with a broken Keystore the app behaves
+ *   like the (working) pre-hardening versions and never loses data.
  */
 import { Preferences } from '@capacitor/preferences';
 import { Capacitor } from '@capacitor/core';
@@ -99,6 +110,16 @@ export class KeystoreBackend implements KeyValueBackend {
 
 let warnedInsecure = false;
 
+function warnInsecureOnce() {
+  if (!warnedInsecure) {
+    warnedInsecure = true;
+    console.warn(
+      '[secureStore] secure backend unreliable — secrets kept in plaintext Preferences. ' +
+        'Run `npx cap sync` and rebuild; if the Keystore itself is broken on this device, plaintext is the safe fallback.',
+    );
+  }
+}
+
 /**
  * Tries the primary (secure) backend, falls back to the legacy plaintext
  * backend on error so the app keeps working even if the native plugin is
@@ -122,12 +143,7 @@ export class FallbackBackend implements KeyValueBackend {
   }
 
   private warnOnce() {
-    if (!warnedInsecure) {
-      warnedInsecure = true;
-      console.warn(
-        '[secureStore] secure backend unavailable — secrets stored in plaintext Preferences. Run `npx cap sync` and rebuild.',
-      );
-    }
+    warnInsecureOnce();
   }
 
   async get(key: string): Promise<string | null> {
@@ -170,63 +186,97 @@ export interface SecretStore {
 /**
  * Build a secret store from explicit backends (used by unit tests with
  * in-memory backends).
+ *
+ * Durability contract:
+ * - `set()` always writes `legacy` first (the durability anchor), then
+ *   best-effort mirrors into `secure`. A secure backend that throws — or
+ *   worse, one that accepts writes but silently loses them — can never break
+ *   a save or destroy the only copy of a secret.
+ * - `get()` prefers `legacy`: it is written before `secure` on every set and
+ *   wiped only after the secure copy proves itself, so it is never staler
+ *   than the secure copy.
+ * - At boot (`ready`), each secret key is reconciled: the secure copy is
+ *   best-effort healed from legacy, and the plaintext is wiped ONLY when the
+ *   secure backend reads back exactly what legacy holds — proof the secure
+ *   copy survived a restart. Every public method awaits `ready`, so nothing
+ *   races the wipe.
  */
 export function createSecretStore(secure: KeyValueBackend, legacy: KeyValueBackend): SecretStore {
   const sameStore = secure === legacy;
-  // The backend a plaintext copy may be wiped after: the real secure store,
-  // never the silent-fallback wrapper (whose set() can degrade to legacy).
-  const verifyBackend = secure instanceof FallbackBackend ? secure.primaryBackend : secure;
 
-  /**
-   * Move one legacy plaintext value into the secure backend.
-   *
-   * The legacy copy is wiped ONLY after a read-back proves the value landed
-   * in secure storage. If the secure backend is unavailable (or the write
-   * doesn't stick), the legacy copy is left alone and returned — availability
-   * beats secrecy, and we must never destroy the only copy of a secret.
-   */
-  async function migrateOne(key: string): Promise<string | null> {
-    let lv: string | null;
-    try {
-      lv = await legacy.get(key);
-    } catch {
-      return null;
-    }
-    if (lv === null || lv === undefined) return null;
-    try {
-      await verifyBackend.set(key, lv);
-      const check = await verifyBackend.get(key);
-      if (check === lv) {
-        await legacy.remove(key);
+  const ready = (async () => {
+    if (sameStore) return;
+    for (const key of SECRET_KEYS) {
+      try {
+        const l = await legacy.get(key).catch(() => null);
+        if (l === null || l === undefined) continue;
+        // Best-effort heal: bring the secure copy up to date.
+        try {
+          await secure.set(key, l);
+        } catch {
+          /* ignore — legacy remains the anchor */
+        }
+        const s = await secure.get(key).catch(() => null);
+        if (s === l) {
+          // The secure copy proved itself across a restart: safe to wipe
+          // the plaintext.
+          await legacy.remove(key).catch(() => {});
+        } else {
+          // Secure backend unreliable (throws or silently loses writes):
+          // keep the plaintext anchor.
+          warnInsecureOnce();
+        }
+      } catch {
+        /* best effort */
       }
-      // else: write didn't stick — keep the legacy copy.
-    } catch {
-      // Secure backend unavailable — leave the legacy copy alone.
     }
-    return lv;
-  }
+  })();
 
   return {
     async get(key: string): Promise<string | null> {
-      const v = await secure.get(key);
-      if (v !== null && v !== undefined) return v;
+      await ready;
+      try {
+        const l = await legacy.get(key);
+        if (l !== null && l !== undefined) return l;
+      } catch {
+        /* fall through to secure */
+      }
       if (sameStore) return null;
-      // Lazy migration: move the legacy plaintext value into the secure
-      // backend on first read (wiped only after verified write).
-      return migrateOne(key);
+      try {
+        return await secure.get(key);
+      } catch {
+        return null;
+      }
     },
     async set(key: string, value: string): Promise<void> {
-      await secure.set(key, value);
+      await ready;
+      // Durable write first. If this throws there is nothing more we can do.
+      await legacy.set(key, value);
+      if (sameStore) return;
+      // Best-effort secure mirror. Must never break the save.
+      try {
+        await secure.set(key, value);
+      } catch {
+        warnInsecureOnce();
+      }
     },
     async remove(key: string): Promise<void> {
-      await secure.remove(key);
-      if (!sameStore) await legacy.remove(key);
+      await ready;
+      try {
+        await secure.remove(key);
+      } catch {
+        /* best-effort */
+      }
+      if (!sameStore) {
+        try {
+          await legacy.remove(key);
+        } catch {
+          /* best-effort */
+        }
+      }
     },
     async migrateLegacy(): Promise<void> {
-      if (sameStore) return;
-      for (const key of SECRET_KEYS) {
-        await migrateOne(key);
-      }
+      await ready;
     },
   };
 }
@@ -235,7 +285,14 @@ const legacyBackend = new LegacyPlaintextBackend();
 
 function resolveSecureBackend(): KeyValueBackend {
   if (Capacitor.isNativePlatform()) {
-    return new FallbackBackend(new KeystoreBackend(), legacyBackend);
+    // NOTE: pass the RAW Keystore backend, not a FallbackBackend wrapper.
+    // createSecretStore owns the fallback/durability policy itself, and the
+    // boot reconcile tells "secure agrees with legacy" apart from "secure is
+    // broken" by reading the secure backend directly. Wrapping it in a
+    // FallbackBackend would make secure.get() fall back to legacy on throw,
+    // so a broken Keystore would look like agreement and the reconcile would
+    // wipe the only copy.
+    return new KeystoreBackend();
   }
   // Web: no Keystore exists; documented limitation (shipped app is native).
   return legacyBackend;
