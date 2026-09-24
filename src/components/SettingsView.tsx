@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { KaggleAccount, LaunchConfig } from '../services/types';
 import { KaggleApi } from '../services/kaggle';
 import {
@@ -13,9 +13,16 @@ import {
   Key,
   Eye,
   EyeOff,
+  Bell,
+  RefreshCw,
 } from 'lucide-react';
 import { Preferences } from '@capacitor/preferences';
+import { Capacitor } from '@capacitor/core';
 import { secretStore } from '../services/secureStore';
+import {
+  isBatteryOptimizationIgnored,
+  requestBatteryOptimizationExemption,
+} from '../services/queueMonitor';
 
 interface SettingsViewProps {
   accounts: KaggleAccount[];
@@ -49,6 +56,34 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [localConfig, setLocalConfig] = useState<LaunchConfig>(config);
   const [showTokens, setShowTokens] = useState<Record<string, boolean>>({});
   const [saveSuccess, setSaveSuccess] = useState(false);
+  // null = checking / unavailable on web
+  const [batteryIgnored, setBatteryIgnored] = useState<boolean | null>(null);
+
+  const refreshBatteryStatus = async () => {
+    if (!Capacitor.isNativePlatform()) {
+      setBatteryIgnored(null);
+      return;
+    }
+    try {
+      setBatteryIgnored(await isBatteryOptimizationIgnored());
+    } catch {
+      setBatteryIgnored(null);
+    }
+  };
+
+  useEffect(() => {
+    refreshBatteryStatus();
+  }, []);
+
+  const handleRequestBatteryExemption = async () => {
+    try {
+      await requestBatteryOptimizationExemption();
+    } catch {
+      // System dialog unavailable — user can enable it manually.
+    }
+    // Re-check when the user comes back (dialog result is not delivered).
+    setTimeout(refreshBatteryStatus, 1500);
+  };
 
   const toggleShowToken = (id: string) => {
     setShowTokens((prev) => ({ ...prev, [id]: !prev[id] }));
@@ -324,6 +359,49 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             }
           />
         </div>
+      </div>
+
+      {/* Background notifications */}
+      <div className="glass-card">
+        <div className="card-title">
+          <Bell size={16} color="var(--accent-cyan)" />
+          <span>Background Notifications</span>
+        </div>
+        <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '10px', lineHeight: 1.5 }}>
+          When the app is backgrounded, a system service keeps watching the TPU queue and notifies you
+          once the kernel is ready. Android's battery optimization can suspend that service — exempt the
+          app below for reliable alerts.
+        </div>
+        {!Capacitor.isNativePlatform() ? (
+          <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>
+            Battery settings are only available in the Android app.
+          </div>
+        ) : batteryIgnored === null ? (
+          <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>Checking battery optimization status…</div>
+        ) : (
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+            {batteryIgnored ? (
+              <span style={{ display: 'flex', alignItems: 'center', gap: '4px', color: 'var(--accent-emerald)', fontSize: '12px', fontWeight: 600 }}>
+                <CheckCircle size={13} /> Exempt — background alerts will work
+              </span>
+            ) : (
+              <span style={{ display: 'flex', alignItems: 'center', gap: '4px', color: 'var(--accent-rose)', fontSize: '12px', fontWeight: 600 }}>
+                <AlertCircle size={13} /> Not exempt — background alerts may be suspended
+              </span>
+            )}
+            <div style={{ display: 'flex', gap: '8px', marginLeft: 'auto' }}>
+              {!batteryIgnored && (
+                <button className="btn btn-secondary btn-sm" onClick={handleRequestBatteryExemption}>
+                  <Shield size={14} />
+                  <span>Request Exemption</span>
+                </button>
+              )}
+              <button className="btn btn-secondary btn-sm" onClick={refreshBatteryStatus} title="Refresh status">
+                <RefreshCw size={14} />
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Save Button */}
