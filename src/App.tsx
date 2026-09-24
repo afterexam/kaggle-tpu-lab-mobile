@@ -8,7 +8,6 @@ import { ExportModal } from './components/ExportModal';
 import { Cpu, LayoutDashboard, MessageSquare, Settings } from 'lucide-react';
 import { clearKaggleCookies } from './services/kaggle';
 import { Preferences } from '@capacitor/preferences';
-import { secretStore } from './services/secureStore';
 
 export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'dashboard' | 'chat' | 'settings'>('dashboard');
@@ -60,21 +59,25 @@ export const App: React.FC = () => {
         setLiveEndpoint(undefined);
       }
 
-      // Persist current sessions state (holds kernel API keys → encrypted store)
-      secretStore.set('ktl_sessions', JSON.stringify(newSessions)).catch(() => {});
+      // Persist current sessions state
+      try {
+        Preferences.set({ key: 'ktl_sessions', value: JSON.stringify(newSessions) });
+      } catch {}
+      try {
+        localStorage.setItem('ktl_sessions', JSON.stringify(newSessions));
+      } catch {}
     });
 
     // Read stored config, migrate legacy account data and restore sessions
     (async () => {
-      // Eagerly sweep any leftover plaintext secrets into the encrypted store.
-      secretStore.migrateLegacy().catch(() => {});
       try {
         let accList: any = null;
-        // secretStore lazily migrates legacy plaintext (Preferences/localStorage)
-        // into the encrypted store on first read and wipes the plaintext copy.
-        const accRaw = await secretStore.get('ktl_accounts');
-        if (accRaw) {
-          accList = JSON.parse(accRaw);
+        const accData = await Preferences.get({ key: 'ktl_accounts' });
+        if (accData.value) {
+          accList = JSON.parse(accData.value);
+        } else {
+          const raw = localStorage.getItem('ktl_accounts');
+          if (raw) accList = JSON.parse(raw);
         }
 
         const normalizeAccountName = (name: any, index: number): string => {
@@ -108,7 +111,10 @@ export const App: React.FC = () => {
           }));
           setAccounts(finalAccounts);
           // Auto-migrate persisted storage so legacy Chinese names are permanently cleaned
-          secretStore.set('ktl_accounts', JSON.stringify(finalAccounts)).catch(() => {});
+          try {
+            Preferences.set({ key: 'ktl_accounts', value: JSON.stringify(finalAccounts) });
+            localStorage.setItem('ktl_accounts', JSON.stringify(finalAccounts));
+          } catch {}
         }
 
         const cfgData = await Preferences.get({ key: 'ktl_config' });
@@ -119,11 +125,16 @@ export const App: React.FC = () => {
           if (raw) setConfig(JSON.parse(raw));
         }
 
-        // Read and restore historical session records (holds kernel API keys → encrypted store)
+        // Read and restore historical session records
         let savedSessions: RaceSession[] = [];
         try {
-          const sessRaw = await secretStore.get('ktl_sessions');
-          if (sessRaw) savedSessions = JSON.parse(sessRaw);
+          const sessData = await Preferences.get({ key: 'ktl_sessions' });
+          if (sessData.value) {
+            savedSessions = JSON.parse(sessData.value);
+          } else {
+            const raw = localStorage.getItem('ktl_sessions');
+            if (raw) savedSessions = JSON.parse(raw);
+          }
         } catch {}
 
         if (Array.isArray(savedSessions) && savedSessions.length > 0) {
@@ -137,7 +148,10 @@ export const App: React.FC = () => {
           if (instanceManagerRef.current) {
             instanceManagerRef.current.restoreSessions(savedSessions);
           }
-          secretStore.set('ktl_sessions', JSON.stringify(savedSessions)).catch(() => {});
+          try {
+            Preferences.set({ key: 'ktl_sessions', value: JSON.stringify(savedSessions) });
+            localStorage.setItem('ktl_sessions', JSON.stringify(savedSessions));
+          } catch {}
         }
 
         // Silently probe cloud status for all accounts on boot
